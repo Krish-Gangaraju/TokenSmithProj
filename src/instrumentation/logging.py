@@ -89,6 +89,41 @@ class RunLogger:
                     
         log_file = self.logs_dir / f"{log_id}.json"
         
+        # Normalize log_data so all dict keys and numpy types are JSON-serializable.
+        def _normalize_for_json(obj):
+            # recursive normalization
+            if isinstance(obj, dict):
+                new = {}
+                for k, v in obj.items():
+                    # normalize key
+                    try:
+                        if isinstance(k, np.integer):
+                            nk = int(k)
+                        elif isinstance(k, (str, int, float, bool)):
+                            nk = k
+                        else:
+                            nk = str(k)
+                    except Exception:
+                        nk = str(k)
+                    new[nk] = _normalize_for_json(v)
+                return new
+            if isinstance(obj, list):
+                return [_normalize_for_json(x) for x in obj]
+            # numpy scalar types -> native python types
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+
+        try:
+            log_data = _normalize_for_json(log_data)
+        except Exception:
+            # If normalization fails for any reason, fall back to original log_data
+            pass
+
         # Write as a single pretty-printed JSON file
         with open(log_file, "w", encoding="utf-8") as f:
             json.dump(log_data, f, ensure_ascii=False, indent=4, cls=NpEncoder)

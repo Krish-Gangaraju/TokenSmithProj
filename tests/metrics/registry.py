@@ -22,7 +22,13 @@ class MetricRegistry:
         self.register(SemanticSimilarityMetric())
         self.register(KeywordMatchMetric())
         self.register(NLIEntailmentMetric())
-        self.register(AsyncLLMJudgeMetric())
+        # Async LLM judge requires external API credentials. Attempt to
+        # register it but do not fail test discovery if initialization
+        # raises (e.g., missing API key). This keeps tests hermetic.
+        try:
+            self.register(AsyncLLMJudgeMetric())
+        except Exception as e:  # pragma: no cover - environment dependent
+            print(f"Skipping AsyncLLMJudgeMetric registration: {e}")
         self.register(ChunkRetrievalMetric())
 
     def register(self, metric: MetricBase):

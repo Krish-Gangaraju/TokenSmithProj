@@ -32,7 +32,9 @@ class RAGConfig:
 
     # generation
     max_gen_tokens: int = 400
-    gen_model: str = "models/qwen2.5-3b-instruct-q8_0.gguf"
+    # Default generator model: point to a model that exists in `models/`.
+    # Updated to use the 1.5B model present in the repo workspace.
+    gen_model: str = "models/qwen2.5-1.5b-instruct-q5_k_m.gguf"
 
     # testing
     system_prompt_mode: str = "baseline"

@@ -27,6 +27,7 @@ from src.retriever import (
     load_artifacts
 )
 from src.ranking.reranker import rerank
+from src.instrumentation.diagnostics import compute_retrieval_metrics, compute_rank_diagnostics
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -186,6 +187,14 @@ def get_answer(
                     "index_rank": index_ranks.get(idx, 0),
                 })
 
+        # Prepare diagnostics that should be saved with logs
+        # Ensure raw_scores and ordered (fused) ranks are available
+        try:
+            rank_diagnostics = compute_rank_diagnostics(raw_scores, ordered, topk_idxs)
+        except Exception:
+            rank_diagnostics = {}
+
+
         # Step 3: Final re-ranking
         ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.rerank_top_k)
         # print("Reranked Chunks", type(ranked_chunks), len(ranked_chunks), type(ranked_chunks[0]) if ranked_chunks else "No chunks")
@@ -233,6 +242,62 @@ def get_answer(
         # Logging
         meta = artifacts.get("meta", [])
         page_nums = get_page_numbers(topk_idxs, meta)
+
+        if additional_log_info is None:
+            additional_log_info = {}
+
+        # Attach raw retriever scores and rank diagnostics
+        if 'raw_scores' in locals():
+            additional_log_info.setdefault('raw_retriever_scores', raw_scores)
+        additional_log_info.setdefault('rank_diagnostics', rank_diagnostics)
+
+        # If golden_chunks provided (ids or texts), try to normalize to ids and compute metrics
+        if golden_chunks:
+            # If golden_chunks looks like ints, use directly; else try to map from chunk text to indices
+            golden_ids = []
+            if all(isinstance(g, int) for g in golden_chunks):
+                golden_ids = golden_chunks
+            else:
+                # try to find matching indices by content
+                for g in golden_chunks:
+                    try:
+                        idx = chunks.index(g)
+                        golden_ids.append(idx)
+                    except ValueError:
+                        # not found; skip
+                        continue
+
+            try:
+                retrieval_metrics = compute_retrieval_metrics(topk_idxs, golden_ids)
+                additional_log_info.setdefault('retrieval_metrics', retrieval_metrics)
+            except Exception:
+                pass
+
+        # Build a small top-3 retrieved chunk summary (used for returning to callers)
+        top_three_info: List[Dict[str, Any]] = []
+        try:
+            # fused scores are available when ranking was run
+            if 'ordered' in locals() and 'scores' in locals():
+                fused_scores = {int(idx): float(s) for idx, s in zip(ordered, scores)}
+            else:
+                fused_scores = {}
+
+            for rank, idx in enumerate(topk_idxs[:3], start=1):
+                top_three_info.append({
+                    "rank": rank,
+                    "idx": int(idx),
+                    "chunk": chunks[int(idx)],
+                    "source": sources[int(idx)] if int(idx) < len(sources) else None,
+                    "score": fused_scores.get(int(idx)),
+                    "page_number": page_nums.get(int(idx), 1)
+                })
+        except Exception:
+            top_three_info = []
+
+        # Also attach the top-3 info to additional_log_info for easier searching in logs
+        if top_three_info:
+            additional_log_info.setdefault('top_retrieved_chunks', top_three_info)
+
         logger.save_chat_log(
             query=question,
             config_state=cfg.get_config_state(),
@@ -249,7 +314,9 @@ def get_answer(
             top_k=len(topk_idxs),
             additional_log_info=additional_log_info
         )
-        return ans
+        # Return both the answer text and the top-3 retrieved chunk metadata so callers
+        # (or scripts) can display them without parsing logs.
+        return ans, top_three_info
 
 def render_streaming_ans(console, stream_iter):
     ans = ""
@@ -326,13 +393,32 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                     effective_q = q
             
             # Use the single query function. get_answer also renders the streaming markdown and takes care of logging, so we need not do anything else here.
-            ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
+            result = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
+
+            # Result may be either a plain string (legacy) or a tuple (answer_text, top_three_info)
+            if isinstance(result, tuple):
+                answer_text, top_three = result
+            else:
+                answer_text = result
+                top_three = None
+
+            # Print the top-3 retrieved chunks (if present) so the user sees provenance.
+            try:
+                if top_three:
+                    console.print("\n[bold green]Top retrieved chunks (provenance):[/bold green]")
+                    for entry in top_three:
+                        console.print(f"  {entry.get('rank')}. idx={entry.get('idx')} page={entry.get('page_number')} score={entry.get('score')}")
+                        console.print(Markdown(entry.get('chunk')[:800]))
+                        console.print("")
+            except Exception:
+                # non-fatal: continue if printing fails
+                pass
 
             # Update Chat history (make it atomic for user + assistant turn)
             try:
-                user_turn      = {"role": "user", "content": q}
-                assistant_turn = {"role": "assistant", "content": ans}
-                chat_history  += [user_turn, assistant_turn]
+                user_turn = {"role": "user", "content": q}
+                assistant_turn = {"role": "assistant", "content": answer_text}
+                chat_history += [user_turn, assistant_turn]
             except Exception as e:
                 print(f"Warning: Failed to update chat history: {e}")
                 # We can continue without chat history, so we do not break the loop here.
