@@ -15,7 +15,10 @@ from typing import List, Tuple, Optional, Dict, Any
 import nltk
 from nltk.stem import WordNetLemmatizer
 
-import faiss
+try:
+    import faiss
+except ImportError:  # pragma: no cover - lightweight tests mock retrieval artifacts
+    faiss = None
 import numpy as np
 from src.embedder import CachedEmbedder
 
@@ -44,6 +47,8 @@ def load_artifacts(artifacts_dir: os.PathLike, index_prefix: str) -> Tuple[faiss
       - sources:     {index_prefix}_sources.pkl
     """
     artifacts_dir = pathlib.Path(artifacts_dir)
+    if faiss is None:
+        raise RuntimeError("faiss is required to load retrieval artifacts but is not installed.")
     faiss_index = faiss.read_index(str(artifacts_dir / f"{index_prefix}.faiss"))
     bm25_index  = pickle.load(open(artifacts_dir / f"{index_prefix}_bm25.pkl", "rb"))
     chunks      = pickle.load(open(artifacts_dir / f"{index_prefix}_chunks.pkl", "rb"))
@@ -66,7 +71,11 @@ def get_page_numbers(chunk_indices: list[int], metadata: list[dict]) -> dict[int
         if 0 <= chunk_idx < len(metadata):
             chunk_pages = metadata[chunk_idx].get("page_numbers")
             if chunk_pages is None:
+                chunk_pages = metadata[chunk_idx].get("page_number")
+            if chunk_pages is None:
                 continue  # don't store None; callers can default to [1]
+            if isinstance(chunk_pages, int):
+                chunk_pages = [chunk_pages]
             page_map[chunk_idx] = chunk_pages
 
     return page_map

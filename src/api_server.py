@@ -10,7 +10,7 @@ import traceback
 from uuid import uuid4
 from copy import deepcopy
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import traceback
 import os
 
@@ -34,9 +34,11 @@ from src.feedback_store import (
     update_user_topic_state,
 )
 from src.instrumentation.logging import get_logger
+from src.instrumentation.diagnostics import compute_retrieval_metrics, compute_rank_diagnostics
 from src.ranking.ranker import EnsembleRanker
 from src.retriever import filter_retrieved_chunks, BM25Retriever, FAISSRetriever, IndexKeywordRetriever, get_page_numbers, load_artifacts
 from src.user_feedback_model import TopicExtractor, estimate_difficulty
+from src.citations import build_citation_context, verify_and_repair_citations
 
 # Constants
 INDEX_PREFIX = "textbook_index"
@@ -67,6 +69,7 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = None
     top_k: Optional[int] = None  # Alternative name for max_chunks, takes precedence if both provided
     session_id: Optional[str] = None
+    golden_chunks: Optional[List[int]] = None
 
 
 class FeedbackRequest(BaseModel):
@@ -88,6 +91,8 @@ class ChatResponse(BaseModel):
     sources: List[SourceItem]
     chunks_used: List[int]
     chunks_by_page: Dict[int, List[str]]
+    retrieval_diagnostics: Optional[Dict[str, Any]] = None
+    citation_verification: Optional[Dict[str, Any]] = None
     query: str
 
 
@@ -104,7 +109,7 @@ def _ensure_initialized():
         )
 
 def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, full_response_accumulator, request,
-                 enable_chunks, prompt_type, max_chunks, temperature):
+                 enable_chunks, prompt_type, max_chunks, temperature, additional_log_info=None):
     try:
         # Capture the actual strings used for the log file
         log_chunks = [chunks[i] for i in topk_idxs[:max_chunks]]
@@ -138,7 +143,8 @@ def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, 
             sources=log_sources,
             page_map=page_nums,
             full_response="".join(full_response_accumulator),
-            top_k=max_chunks
+            top_k=max_chunks,
+            additional_log_info=additional_log_info
         )
 
         return True
@@ -146,7 +152,7 @@ def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, 
     except Exception as log_exc:
         return False
 
-def _retrieve_and_rank(query: str, top_k: Optional[int] = None):
+def _retrieve_and_rank(query: str, top_k: Optional[int] = None, include_diagnostics: bool = False):
     chunks = _artifacts["chunks"]
     effective_top_k = top_k if top_k is not None else _config.top_k
     pool_n = max(_config.num_candidates, effective_top_k + 10)
@@ -155,15 +161,14 @@ def _retrieve_and_rank(query: str, top_k: Optional[int] = None):
     for retriever in _retrievers:
         raw_scores[retriever.name] = retriever.get_scores(query, pool_n, chunks)
 
-    ordered_ids, ordered_scores = _ranker.rank(raw_scores=raw_scores)
+    all_ordered_ids, all_ordered_scores = _ranker.rank(raw_scores=raw_scores)
 
-    if top_k is not None:
-        ordered_ids = ordered_ids[:top_k]
-        ordered_scores = ordered_scores[:top_k]
-    else:
-        ordered_ids = ordered_ids[:_config.top_k]
-        ordered_scores = ordered_scores[:_config.top_k]
+    ordered_ids = all_ordered_ids[:effective_top_k]
+    ordered_scores = all_ordered_scores[:effective_top_k]
 
+    if include_diagnostics:
+        rank_diagnostics = compute_rank_diagnostics(raw_scores, all_ordered_ids, ordered_ids)
+        return ordered_ids, ordered_scores, raw_scores, rank_diagnostics
     return ordered_ids, ordered_scores
 
 @asynccontextmanager
@@ -330,18 +335,19 @@ async def test_chat(request: ChatRequest):
         }
 
     try:
-        # ✅ Correct order (matches /api/chat)
-        topk_idxs, ordered_ranked_scores = _retrieve_and_rank(
-            request.query, top_k=max_chunks
+        topk_idxs, ordered_ranked_scores, raw_scores, rank_diagnostics = _retrieve_and_rank(
+            request.query, top_k=max_chunks, include_diagnostics=True
         )
 
         # Ensure safe types
         topk_idxs = [int(i) for i in (topk_idxs or [])]
-        ordered_ranked_scores = ordered_ranked_scores or {}
+        ordered_ranked_scores = ordered_ranked_scores or []
 
         ranked_chunks = [
             _artifacts["chunks"][i] for i in topk_idxs[:max_chunks]
         ]
+
+        retrieval_metrics = compute_retrieval_metrics(topk_idxs, request.golden_chunks or [])
 
         return {
             "status": "success",
@@ -349,6 +355,10 @@ async def test_chat(request: ChatRequest):
             "chunks_found": len(ranked_chunks),
             "top_chunks": ranked_chunks[:3],
             "raw_scores": ordered_ranked_scores,
+            "ordered_scores": ordered_ranked_scores,
+            "raw_retriever_scores": raw_scores,
+            "rank_diagnostics": rank_diagnostics,
+            "retrieval_metrics": retrieval_metrics,
             "top_idxs": topk_idxs,
             "message": "Retrieval and ranking successful, generation skipped",
         }
@@ -378,12 +388,20 @@ async def chat_stream(request: ChatRequest):
     chunks = _artifacts["chunks"]
     sources = _artifacts["sources"]
     
+    raw_scores: Dict[str, Dict[int, float]] = {}
+    rank_diagnostics: Dict[str, Any] = {}
+    retrieval_metrics: Dict[str, Any] = {}
+    citation_map: List[Dict[str, Any]] = []
+
     if disable_chunks:
-        ranked_chunks, topk_idxs = [], []
+        ranked_chunks, topk_idxs, ordered_ranked_scores = [], [], []
     else:
-        topk_idxs, ordered_ranked_scores = _retrieve_and_rank(request.query, top_k=max_chunks)
+        topk_idxs, ordered_ranked_scores, raw_scores, rank_diagnostics = _retrieve_and_rank(
+            request.query, top_k=max_chunks, include_diagnostics=True
+        )
         topk_idxs = [int(i) for i in topk_idxs]
         ranked_chunks = [chunks[i] for i in topk_idxs[:max_chunks]]
+        retrieval_metrics = compute_retrieval_metrics(topk_idxs, request.golden_chunks or [])
     
     if not _config.gen_model:
         raise HTTPException(status_code=500, detail="Model path not configured.")
@@ -395,13 +413,20 @@ async def chat_stream(request: ChatRequest):
         full_response_accumulator = []
         try:
             page_nums = get_page_numbers(topk_idxs, _artifacts["meta"])
+            generation_chunks = ranked_chunks
+            citation_map: List[Dict[str, Any]] = []
+            if ranked_chunks and topk_idxs:
+                generation_chunks, citation_map = build_citation_context(
+                    ranked_chunks,
+                    topk_idxs,
+                    sources,
+                    page_nums,
+                )
             sources_used = set()
             chunks_by_page: Dict[int, List[str]] = {}
             for i in topk_idxs[:max_chunks]:
                 source_text = sources[i]
                 pages = page_nums.get(i, [1]) or [1]
-
-                print(f"[DEBUG] i={i} pages={pages!r} page_nums_has_key={i in page_nums}", flush=True)
 
                 for page in pages:
                     chunks_by_page.setdefault(page, []).append(chunks[i])
@@ -409,17 +434,34 @@ async def chat_stream(request: ChatRequest):
             
             yield f"data: {json.dumps({'type': 'sources', 'content': [s.dict() for s in sources_used]})}\n\n"
             yield f"data: {json.dumps({'type': 'chunks_by_page', 'content': chunks_by_page})}\n\n"
+            yield f"data: {json.dumps({'type': 'retrieval_diagnostics', 'content': {'raw_retriever_scores': raw_scores, 'rank_diagnostics': rank_diagnostics, 'retrieval_metrics': retrieval_metrics}})}\n\n"
 
             # Stream generation token by token
-            for delta in answer(request.query, ranked_chunks, _config.gen_model,
+            for delta in answer(request.query, generation_chunks, _config.gen_model,
                               _config.max_gen_tokens, system_prompt_mode=prompt_type, temperature=temperature):
                 if delta:
                     full_response_accumulator.append(delta) # Capture for log
                     yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
+
+            answer_text, citation_verification = verify_and_repair_citations(
+                "".join(full_response_accumulator),
+                citation_map,
+            )
+            if answer_text != "".join(full_response_accumulator):
+                full_response_accumulator[:] = [answer_text]
+                yield f"data: {json.dumps({'type': 'citation_repair', 'content': answer_text})}\n\n"
+            yield f"data: {json.dumps({'type': 'citation_verification', 'content': citation_verification})}\n\n"
             
             if _logger:
+                additional_log_info = {
+                    "raw_retriever_scores": raw_scores,
+                    "rank_diagnostics": rank_diagnostics,
+                    "retrieval_metrics": retrieval_metrics,
+                    "citation_map": citation_map,
+                    "citation_verification": citation_verification,
+                }
                 success_log = _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, full_response_accumulator, request,
-                            enable_chunks, prompt_type, max_chunks, temperature)
+                            enable_chunks, prompt_type, max_chunks, temperature, additional_log_info=additional_log_info)
                 if not success_log:
                     print("Logging failed for this request.")
 
@@ -455,7 +497,7 @@ async def chat_stream(request: ChatRequest):
                     )
 
             # Include sources in the final done message for completeness
-            yield f"data: {json.dumps({'type': 'done', 'answer_id': answer_id, 'session_id': session_id, 'sources': [s.dict() for s in sources_used]})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'answer_id': answer_id, 'session_id': session_id, 'answer': ''.join(full_response_accumulator), 'sources': [s.dict() for s in sources_used], 'citation_verification': citation_verification})}\n\n"
         except Exception as e:
             # Using print here so you can see crashes in the terminal while debugging
             print(f"Backend error: {e}")
@@ -501,37 +543,55 @@ async def chat(request: ChatRequest):
 
     try:
         # 2. Retrieval & Ranking (SAFE against mocked None return)
+        raw_scores: Dict[str, Dict[int, float]] = {}
+        rank_diagnostics: Dict[str, Any] = {}
+        retrieval_metrics: Dict[str, Any] = {}
         if disable_chunks:
-            ranked_chunks, topk_idxs, ordered_ranked_scores = [], [], {}
+            ranked_chunks, topk_idxs, ordered_ranked_scores = [], [], []
         else:
             retrieval_result = _retrieve_and_rank(
-                request.query, top_k=max_chunks
+                request.query, top_k=max_chunks, include_diagnostics=True
             )
 
             # 🔒 Safe unpacking for unit tests where ranker is mocked
             if (
                 not retrieval_result
                 or not isinstance(retrieval_result, (list, tuple))
-                or len(retrieval_result) != 2
+                or len(retrieval_result) not in {2, 4}
             ):
-                topk_idxs, ordered_ranked_scores = [], {}
+                topk_idxs, ordered_ranked_scores = [], []
             else:
-                topk_idxs, ordered_ranked_scores = retrieval_result
+                if len(retrieval_result) == 4:
+                    topk_idxs, ordered_ranked_scores, raw_scores, rank_diagnostics = retrieval_result
+                else:
+                    topk_idxs, ordered_ranked_scores = retrieval_result
 
             topk_idxs = [int(i) for i in (topk_idxs or [])]
-            ordered_ranked_scores = ordered_ranked_scores or {}
+            ordered_ranked_scores = ordered_ranked_scores or []
 
             ranked_chunks = [chunks[i] for i in topk_idxs[:max_chunks]]
+            retrieval_metrics = compute_retrieval_metrics(topk_idxs, request.golden_chunks or [])
 
         if not _config.gen_model:
             raise HTTPException(status_code=500, detail="Model path not configured.")
+
+        page_nums = get_page_numbers(topk_idxs, _artifacts["meta"]) or {}
+        generation_chunks = ranked_chunks
+        citation_map: List[Dict[str, Any]] = []
+        if ranked_chunks and topk_idxs:
+            generation_chunks, citation_map = build_citation_context(
+                ranked_chunks,
+                topk_idxs,
+                sources,
+                page_nums,
+            )
 
         # 3. Full Generation
         try:
             answer_text = "".join(
                 answer(
                     request.query,
-                    ranked_chunks,
+                    generation_chunks,
                     _config.gen_model,
                     _config.max_gen_tokens,
                     system_prompt_mode=prompt_type,
@@ -543,10 +603,12 @@ async def chat(request: ChatRequest):
             answer_text = (
                 "I'm sorry, but I couldn't generate a response due to an internal error."
             )
+        answer_text, citation_verification = verify_and_repair_citations(
+            answer_text,
+            citation_map,
+        )
 
         # 4. Post-processing (Metadata & Pages)
-        page_nums = get_page_numbers(topk_idxs, _artifacts["meta"]) or {}
-
         sources_used = set()
         chunks_by_page: Dict[int, List[str]] = {}
 
@@ -567,6 +629,13 @@ async def chat(request: ChatRequest):
 
         # 5. Logging
         if _logger:
+            additional_log_info = {
+                "raw_retriever_scores": raw_scores,
+                "rank_diagnostics": rank_diagnostics,
+                "retrieval_metrics": retrieval_metrics,
+                "citation_map": citation_map,
+                "citation_verification": citation_verification,
+            }
             success_log = _create_log(
                 chunks,
                 sources,
@@ -579,6 +648,7 @@ async def chat(request: ChatRequest):
                 prompt_type,
                 max_chunks,
                 temperature,
+                additional_log_info=additional_log_info,
             )
             if not success_log:
                 print("Logging failed for this request.")
@@ -624,6 +694,12 @@ async def chat(request: ChatRequest):
             sources=list(sources_used),
             chunks_used=topk_idxs,
             chunks_by_page=chunks_by_page,
+            retrieval_diagnostics={
+                "raw_retriever_scores": raw_scores,
+                "rank_diagnostics": rank_diagnostics,
+                "retrieval_metrics": retrieval_metrics,
+            },
+            citation_verification=citation_verification,
             query=request.query,
         )
 

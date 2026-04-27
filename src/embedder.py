@@ -5,8 +5,12 @@ import multiprocessing.pool
 import numpy as np
 from pathlib import Path
 from typing import List, Union, Optional
-from llama_cpp import Llama
 from tqdm import tqdm
+
+try:
+    from llama_cpp import Llama
+except ImportError:  # pragma: no cover - lightweight tests mock embedding
+    Llama = None
 
 # Global variables for worker processes
 _worker_model: Optional[Llama] = None
@@ -16,6 +20,8 @@ _worker_embedding_dim: int = 0
 def _init_worker(model_path: str, n_ctx: int, n_threads: int):
     """Initializes the model inside a worker process."""
     global _worker_model, _worker_embedding_dim
+    if Llama is None:
+        raise RuntimeError("llama_cpp is required for embedding but is not installed.")
 
     _worker_model = Llama(
         model_path=model_path,
@@ -59,6 +65,8 @@ class SentenceTransformer:
         """
         self.model_path = model_path
         self.n_ctx = n_ctx
+        if Llama is None:
+            raise RuntimeError("llama_cpp is required for embedding but is not installed.")
 
         self.model = Llama(
             model_path=model_path,

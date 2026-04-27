@@ -1,11 +1,15 @@
 import argparse
 import json
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from src.config import RAGConfig
 from src.ranking.ranker import EnsembleRanker
 from src.instrumentation.logging import RunLogger
+
+
+class MinimalConfig(SimpleNamespace):
+    def get_config_state(self):
+        return self.__dict__.copy()
 
 
 class MockRetriever:
@@ -21,7 +25,7 @@ def test_retrieval_diagnostics_minimal(tmp_path, monkeypatch):
     """Lightweight test that runs retrieval and checks the saved log contains diagnostics."""
     from src.main import get_answer
 
-    cfg = RAGConfig(
+    cfg = MinimalConfig(
         top_k=2,
         num_candidates=5,
         ensemble_method="linear",
@@ -30,7 +34,13 @@ def test_retrieval_diagnostics_minimal(tmp_path, monkeypatch):
         use_hyde=False,
         disable_chunks=False,
         rerank_mode="none",
+        rerank_top_k=2,
         use_golden_chunks=True,
+        use_indexed_chunks=False,
+        gen_model="mock-model.gguf",
+        max_gen_tokens=20,
+        system_prompt_mode="baseline",
+        use_double_prompt=False,
     )
 
     args = argparse.Namespace(system_prompt_mode="baseline", index_prefix="test_index")
@@ -67,7 +77,9 @@ def test_retrieval_diagnostics_minimal(tmp_path, monkeypatch):
         tmp_logs.mkdir()
         run_logger.logs_dir = tmp_logs
 
-        # Call get_answer with golden chunk ids [0,2]
+        # Call get_answer with golden chunk ids [0,2], but keep retrieval enabled
+        # so diagnostics compare actual retrieved ids against the benchmark ids.
+        cfg.use_golden_chunks = False
         ans_prod = get_answer(
             question="What is Python?",
             cfg=cfg,
@@ -86,11 +98,13 @@ def test_retrieval_diagnostics_minimal(tmp_path, monkeypatch):
         payload = json.loads(latest.read_text())
 
         # Validate diagnostics present
-        assert "retrieved_chunks" in payload or "top_k" in payload
-        # additional_log_info fields should be present at top-level because save_chat_log expands them
-        # raw_retriever_scores and retrieval_metrics are expected
-        assert payload.get("retrieval_metrics") or payload.get("retrieved_chunks") is not None
-        # raw retriever scores should be under the top-level key added by save_chat_log
-        # We allow either representation, but check that either retrieval_metrics or raw_retriever_scores exist
-        assert ("retrieval_metrics" in payload) or ("raw_retriever_scores" in payload) or ("rank_diagnostics" in payload)
-*** End Patch
+        assert "retrieved_chunks" in payload
+        assert "raw_retriever_scores" in payload
+        assert "rank_diagnostics" in payload
+        assert "retrieval_metrics" in payload
+        assert payload["retrieval_metrics"]["tp"] == 2
+        assert payload["retrieval_metrics"]["fp"] == 0
+        assert payload["retrieval_metrics"]["fn"] == 0
+        assert payload["retrieval_metrics"]["precision_at_k"]["1"] == 1.0
+        assert payload["retrieval_metrics"]["recall_at_k"]["1"] == 0.5
+        assert payload["rank_diagnostics"]["returned"][0]["chunk_id"] in [0, 2]

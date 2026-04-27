@@ -1,5 +1,8 @@
 # noinspection PyUnresolvedReferences
-import faiss  # force single OpenMP init
+try:
+    import faiss  # force single OpenMP init when available
+except ImportError:  # pragma: no cover - lightweight tests mock retrieval artifacts
+    faiss = None
 
 import argparse
 import json
@@ -28,6 +31,7 @@ from src.retriever import (
 )
 from src.ranking.reranker import rerank
 from src.instrumentation.diagnostics import compute_retrieval_metrics, compute_rank_diagnostics
+from src.citations import build_citation_context, verify_and_repair_citations
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
 
@@ -119,13 +123,28 @@ def get_answer(
     ranked_chunks: List[str] = []
     topk_idxs: List[int] = []
     scores = []
+    raw_scores: Dict[str, Dict[int, float]] = {}
+    rank_diagnostics: Dict[str, Any] = {}
+    citation_map: List[Dict[str, Any]] = []
+    citation_verification: Dict[str, Any] = {}
     
     # Step 1: Get chunks (golden, retrieved, or none)
     chunks_info = None
     hyde_query = None
     if golden_chunks and cfg.use_golden_chunks:
-        # Use provided golden chunks
-        ranked_chunks = golden_chunks
+        # Use provided golden chunks. Benchmarks often provide chunk ids, while
+        # older callers may provide literal chunk text.
+        if all(isinstance(g, int) for g in golden_chunks):
+            topk_idxs = [int(g) for g in golden_chunks if 0 <= int(g) < len(chunks)]
+            ranked_chunks = [chunks[i] for i in topk_idxs]
+        else:
+            ranked_chunks = golden_chunks
+            topk_idxs = []
+            for g in golden_chunks:
+                try:
+                    topk_idxs.append(chunks.index(g))
+                except ValueError:
+                    continue
     elif cfg.disable_chunks:
         # No chunks - baseline mode
         ranked_chunks = []
@@ -138,7 +157,6 @@ def get_answer(
             retrieval_query = generate_hypothetical_document(question, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
         
         pool_n = max(cfg.num_candidates, cfg.top_k + 10)
-        raw_scores: Dict[str, Dict[int, float]] = {}
         for retriever in retrievers:
             # print(f"Getting scores from retriever: {retriever.name}...")
             raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
@@ -205,6 +223,17 @@ def get_answer(
             console.print(f"\n{ANSWER_NOT_FOUND}\n")
         return ANSWER_NOT_FOUND
 
+    meta = artifacts.get("meta", [])
+    page_nums = get_page_numbers(topk_idxs, meta)
+    generation_chunks = ranked_chunks
+    if ranked_chunks and topk_idxs:
+        generation_chunks, citation_map = build_citation_context(
+            ranked_chunks,
+            topk_idxs,
+            sources,
+            page_nums,
+        )
+
     # Step 4: Generation
     model_path = cfg.gen_model
     system_prompt = args.system_prompt_mode or cfg.system_prompt_mode
@@ -214,7 +243,7 @@ def get_answer(
     if use_double:
         stream_iter = double_answer(
             question,
-            ranked_chunks,
+            generation_chunks,
             model_path,
             max_tokens=cfg.max_gen_tokens,
             system_prompt_mode=system_prompt,
@@ -222,7 +251,7 @@ def get_answer(
     else:
         stream_iter = answer(
             question,
-            ranked_chunks,
+            generation_chunks,
             model_path,
             max_tokens=cfg.max_gen_tokens,
             system_prompt_mode=system_prompt,
@@ -238,18 +267,18 @@ def get_answer(
     else:
         # Accumulate the full text while rendering incremental Markdown chunks
         ans = render_streaming_ans(console, stream_iter)
+        ans, citation_verification = verify_and_repair_citations(ans, citation_map)
 
         # Logging
-        meta = artifacts.get("meta", [])
-        page_nums = get_page_numbers(topk_idxs, meta)
-
         if additional_log_info is None:
             additional_log_info = {}
 
         # Attach raw retriever scores and rank diagnostics
-        if 'raw_scores' in locals():
+        if raw_scores:
             additional_log_info.setdefault('raw_retriever_scores', raw_scores)
         additional_log_info.setdefault('rank_diagnostics', rank_diagnostics)
+        additional_log_info.setdefault('citation_map', citation_map)
+        additional_log_info.setdefault('citation_verification', citation_verification)
 
         # If golden_chunks provided (ids or texts), try to normalize to ids and compute metrics
         if golden_chunks:

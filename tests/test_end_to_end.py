@@ -113,6 +113,10 @@ def test_end_to_end_pipeline_stubbed():
             artifacts=artifacts,
             is_test_mode=False,
         )
+        if isinstance(ans_prod, tuple):
+            ans_prod, top_three = ans_prod
+        else:
+            top_three = []
 
         
         # 7. Assertions
@@ -120,7 +124,8 @@ def test_end_to_end_pipeline_stubbed():
         # Check LLM output reconstruction
         expected_ans = "This is a dummy response from the stubbed LLM."
         assert ans == expected_ans
-        assert ans_prod == expected_ans
+        assert ans_prod == f"{expected_ans} [C1]"
+        assert top_three
         
         # Check retrieval happened correctly
         # We expect top_k=2.
@@ -156,4 +161,3 @@ def test_end_to_end_pipeline_stubbed():
         # Note: chunks might be passed exactly as they are in the 'chunks' list
         assert any("Python is a programming language." in c for c in passed_chunks)
         assert any("Machine learning uses statistics." in c for c in passed_chunks)
-

@@ -602,7 +602,7 @@ class TestLoadArtifacts:
         """load_artifacts returns expected tuple structure."""
         from src.retriever import load_artifacts
         import pickle
-        import faiss
+        faiss = pytest.importorskip("faiss")
         
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = "test_index"

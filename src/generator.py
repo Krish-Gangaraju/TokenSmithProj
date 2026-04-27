@@ -1,5 +1,10 @@
 import textwrap, re
-from llama_cpp import Llama, LlamaRAMCache
+
+try:
+    from llama_cpp import Llama, LlamaRAMCache
+except ImportError:  # pragma: no cover - exercised only in lightweight test envs
+    Llama = None
+    LlamaRAMCache = None
 
 ANSWER_START = "<<<ANSWER>>>"
 ANSWER_END   = "<<<END>>>"
@@ -83,7 +88,13 @@ def format_prompt(chunks, query, max_chunk_chars=400, system_prompt_mode="tutor"
         context = text_cleaning(context)
         
         # Build prompt with chunks
-        context_section = f"Textbook Excerpts:\n{context}\n\n\n"
+        citation_instruction = ""
+        if any(str(chunk).lstrip().startswith("[C") for chunk in chunks):
+            citation_instruction = (
+                "Use inline citations with the provided chunk labels, such as [C1], "
+                "for every factual claim. Only cite labels that appear in the excerpts.\n\n"
+            )
+        context_section = f"Textbook Excerpts:\n{context}\n\n{citation_instruction}\n"
         
         final_prompt = textwrap.dedent(f"""\
             {system_section}<|im_start|>user
@@ -111,6 +122,8 @@ def format_prompt(chunks, query, max_chunk_chars=400, system_prompt_mode="tutor"
 _LLM_CACHE = {}
 
 def get_llama_model(model_path: str, n_ctx: int = 4096):
+    if Llama is None or LlamaRAMCache is None:
+        raise RuntimeError("llama_cpp is required for local generation but is not installed.")
     if model_path not in _LLM_CACHE:
         try:
             _LLM_CACHE[model_path] = Llama(model_path=model_path,

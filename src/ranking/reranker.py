@@ -5,7 +5,10 @@ This module supports re-ranking strategies applied before the generative LLM cal
 """
 
 from typing import Dict, List
-from sentence_transformers import CrossEncoder
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:  # pragma: no cover - lightweight tests use rerank_mode="none"
+    CrossEncoder = None
 
 # -------------------------- Cross-Encoder Cache --------------------------
 _CROSS_ENCODER_CACHE: Dict[str, CrossEncoder] = {}
@@ -14,6 +17,8 @@ def get_cross_encoder(model_name: str = "cross-encoder/ms-marco-MiniLM-L6-v2"):
     """
     Fetch the cached cross-encoder model to prevent reloading on every query.
     """
+    if CrossEncoder is None:
+        raise RuntimeError("sentence_transformers is required for cross-encoder reranking but is not installed.")
     if model_name not in _CROSS_ENCODER_CACHE:
         _CROSS_ENCODER_CACHE[model_name] = CrossEncoder(model_name)
     return _CROSS_ENCODER_CACHE[model_name]

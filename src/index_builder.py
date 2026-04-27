@@ -12,12 +12,17 @@ import json
 from typing import List, Dict
 
 import numpy as np
-import faiss
-from rank_bm25 import BM25Okapi
+try:
+    import faiss
+except ImportError:  # pragma: no cover - lightweight tests do not build indexes
+    faiss = None
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:  # pragma: no cover - lightweight tests do not build indexes
+    BM25Okapi = None
 from src.embedder import SentenceTransformer
 
 from src.preprocessing.chunking import DocumentChunker, ChunkConfig, print_chunk_stats
-from src.preprocessing.extraction import extract_sections_from_markdown
 
 # ----- runtime parallelism knobs (avoid oversubscription) -----
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -53,6 +58,12 @@ def build_index(
         - {prefix}_meta.pkl
         - {prefix}_page_to_chunk_map.json
     """
+    if faiss is None:
+        raise RuntimeError("faiss is required to build retrieval artifacts but is not installed.")
+    if BM25Okapi is None:
+        raise RuntimeError("rank_bm25 is required to build retrieval artifacts but is not installed.")
+    from src.preprocessing.extraction import extract_sections_from_markdown
+
     all_chunks: List[str] = []
     sources: List[str] = []
     metadata: List[Dict] = []
